@@ -792,25 +792,44 @@ final class PortalBrowser {
                 } ?? []
         }
         // signed out while discovering (redirect to the login): the rest is lost
-        guard onPortal, !onLoginPage else { return ("", "", [], items.count, 1) }
+        guard onPortal, !onLoginPage else {
+            AppModel.debugLog("portal: Visa-Auszüge abgebrochen – abgemeldet (einträge=\(items.count))")
+            return ("", "", [], items.count, 1)
+        }
         // only a verifiably empty statement list counts as "nothing new"; neither
         // a captured response nor visible PDF links (like Amex, a failure) is one
-        guard readable || !items.isEmpty else { return ("", "", [], 0, 1) }
+        guard readable || !items.isEmpty else {
+            AppModel.debugLog("portal: Visa-Auszüge unlesbar – keine Liste erfasst (pfad=\(statementList.map { Self.maskedPath($0.url) } ?? "-"))")
+            return ("", "", [], 0, 1)
+        }
         let card = Self.cardKey(statementList?.token ?? "")
         // visible links without a usable closing date, and captured entries
         // whose PDF has none (the parser's `rejected`): each a statement that
         // exists but cannot be identified — a failure, while known or older
         // ones count fine
         let undated = items.filter { $0.date.count != 10 }.count + rejected
-        guard let knownDates = await known(card, "") else { return (card, "", [], items.count, 1 + undated) }
+        guard let knownDates = await known(card, "") else {
+            AppModel.debugLog("portal: Visa-Auszüge abgebrochen – bekannte Daten nicht lesbar (karte=\(card.isEmpty ? "-" : "ja"))")
+            return (card, "", [], items.count, 1 + undated)
+        }
         let wanted = items
             .filter { $0.date.count == 10 && $0.date >= since && !knownDates.contains($0.date) }
             .map { (date: $0.date, path: $0.path, ref: $0.ref) }
             .sorted { $0.date > $1.date }
         let todo = Array(wanted.prefix(limit))
+        if todo.isEmpty {
+            AppModel.debugLog("portal: Visa-Auszüge – nichts zu laden (einträge=\(items.count), bekannt=\(knownDates.count), seit=\(since))")
+        }
         guard !todo.isEmpty, onPortal, !onLoginPage, let keyHost = currentURL?.host else {
             return (card, "", [], items.count, undated)
         }
+        // the API host the statements list came from — the document requests
+        // go to the same host (live-checked at the real portal)
+        let apiBase = statementList.flatMap { URL(string: $0.url) }.map { api -> String in
+            "\(api.scheme ?? "https")://\(api.host ?? "")"
+        } ?? ""
+        var out: [PortalStatement] = []
+        AppModel.debugLog("portal: Visa-Auszüge laden – \(todo.count) von \(items.count) (api=\(apiBase))")
         let download = """
         try {
           if (location.protocol !== 'https:' || location.host !== host) return '';
@@ -829,17 +848,19 @@ final class PortalBrowser {
         """
         // Open Bank: the entry names its PDF by document id — the first request
         // (same API host as the statements list) answers `documentUri`, the
-        // second fetches the PDF itself (a signed URL, another host allowed)
+        // second fetches the PDF itself (a signed URL, another host allowed).
+        // A failure answers a JSON object naming the step and status (no
+        // secrets), so the debug log shows where the retrieval broke.
         let downloadByDocumentId = """
         try {
-          if (location.protocol !== 'https:') return '';
+          if (location.protocol !== 'https:') return JSON.stringify({step: 'scheme'});
           var r = await fetch(api + '/mb-api-documents/v2/documents/' + encodeURIComponent(id) + '/versions/' + encodeURIComponent(ver), {credentials: 'include'});
-          if (!r.ok) return '';
+          if (!r.ok) return JSON.stringify({step: 'documents', status: r.status});
           var j = await r.json();
           var uri = j && typeof j.documentUri === 'string' ? j.documentUri : '';
-          if (!uri || uri.indexOf('https:') !== 0) return '';
+          if (!uri || uri.indexOf('https:') !== 0) return JSON.stringify({step: 'documentUri', hasUri: !!uri});
           var r2 = await fetch(uri, {credentials: 'include'});
-          if (!r2.ok) return '';
+          if (!r2.ok) return JSON.stringify({step: 'pdf', status: r2.status});
           var blob = await r2.blob();
           return await new Promise(function(done) {
             var f = new FileReader();
@@ -847,14 +868,8 @@ final class PortalBrowser {
             f.onerror = function() { done(''); };
             f.readAsDataURL(blob);
           });
-        } catch (e) { return ''; }
+        } catch (e) { return JSON.stringify({step: 'error'}); }
         """
-        // the API host the statements list came from — the document requests
-        // go to the same host (live-checked at the real portal)
-        let apiBase = statementList.flatMap { URL(string: $0.url) }.map { api -> String in
-            "\(api.scheme ?? "https")://\(api.host ?? "")"
-        } ?? ""
-        var out: [PortalStatement] = []
         var failed = undated
         for (n, s) in todo.enumerated() {
             guard onPortal, !onLoginPage, currentURL?.host == keyHost else {
@@ -872,6 +887,12 @@ final class PortalBrowser {
                                                               contentWorld: .page) as? String) ?? ""
             }
             guard let data = Data(base64Encoded: b64), data.starts(with: Array("%PDF".utf8)) else {
+                if b64.hasPrefix("{"), let d = b64.data(using: .utf8),
+                   let info = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
+                    AppModel.debugLog("portal: Visa-PDF nicht ladbar – \(info)")
+                } else {
+                    AppModel.debugLog("portal: Visa-PDF nicht ladbar – keine Antwort (link=\(s.ref == nil))")
+                }
                 failed += 1
                 continue
             }
