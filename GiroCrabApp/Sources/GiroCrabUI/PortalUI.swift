@@ -846,28 +846,26 @@ final class PortalBrowser {
           });
         } catch (e) { return ''; }
         """
-        // Open Bank: the entry names its PDF by document id — the first request
-        // (same API host as the statements list) answers `documentUri`, the
-        // second fetches the PDF itself (a signed URL, another host allowed).
-        // A failure answers a JSON object naming the step and status (no
+        // Open Bank: the entry names its PDF by document id. The documents
+        // request goes to the API host of the captured statements list and
+        // authenticates with the `accesstoken` header — the portal reads its
+        // value from the `accessToken` cookie (live-checked: no cookies reach
+        // the API host, the header is what decides). The answer's
+        // `documentUri` is a self-authenticating signed URL (S3): the app
+        // downloads it natively, the page need not read it (no CORS). A
+        // failure answers a JSON object naming the step and status (no
         // secrets), so the debug log shows where the retrieval broke.
-        let downloadByDocumentId = """
+        let resolveDocumentUri = """
         try {
           if (location.protocol !== 'https:') return JSON.stringify({step: 'scheme'});
-          var r = await fetch(api + '/mb-api-documents/v2/documents/' + encodeURIComponent(id) + '/versions/' + encodeURIComponent(ver), {credentials: 'include'});
+          var m = document.cookie.match(/(?:^|;\\s*)accessToken=([^;]*)/);
+          if (!m) return JSON.stringify({step: 'token'});
+          var r = await fetch(api + '/mb-api-documents/v2/documents/' + encodeURIComponent(id) + '/versions/' + encodeURIComponent(ver), {credentials: 'include', headers: {'accesstoken': m[1]}});
           if (!r.ok) return JSON.stringify({step: 'documents', status: r.status});
           var j = await r.json();
           var uri = j && typeof j.documentUri === 'string' ? j.documentUri : '';
           if (!uri || uri.indexOf('https:') !== 0) return JSON.stringify({step: 'documentUri', hasUri: !!uri});
-          var r2 = await fetch(uri, {credentials: 'include'});
-          if (!r2.ok) return JSON.stringify({step: 'pdf', status: r2.status});
-          var blob = await r2.blob();
-          return await new Promise(function(done) {
-            var f = new FileReader();
-            f.onload = function() { done(String(f.result).split(',')[1] || ''); };
-            f.onerror = function() { done(''); };
-            f.readAsDataURL(blob);
-          });
+          return JSON.stringify({uri: uri});
         } catch (e) { return JSON.stringify({step: 'error'}); }
         """
         var failed = undated
@@ -876,23 +874,40 @@ final class PortalBrowser {
                 failed += todo.count - n
                 break
             }
-            var b64 = ""
             if let ref = s.ref, !apiBase.isEmpty {
-                b64 = (try? await webView.callAsyncJavaScript(downloadByDocumentId,
-                                                              arguments: ["api": apiBase, "id": ref.documentId,
-                                                                          "ver": ref.version.isEmpty ? "1" : ref.version],
-                                                              contentWorld: .page) as? String) ?? ""
-            } else {
-                b64 = (try? await webView.callAsyncJavaScript(download, arguments: ["path": s.path, "host": keyHost],
-                                                              contentWorld: .page) as? String) ?? ""
-            }
-            guard let data = Data(base64Encoded: b64), data.starts(with: Array("%PDF".utf8)) else {
-                if b64.hasPrefix("{"), let d = b64.data(using: .utf8),
-                   let info = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
-                    AppModel.debugLog("portal: Visa-PDF nicht ladbar – \(info)")
-                } else {
-                    AppModel.debugLog("portal: Visa-PDF nicht ladbar – keine Antwort (link=\(s.ref == nil))")
+                // the signed URL resolves in the page, the PDF itself loads
+                // natively (the signature authenticates, no portal cookies)
+                let raw = (try? await webView.callAsyncJavaScript(resolveDocumentUri,
+                                                                  arguments: ["api": apiBase, "id": ref.documentId,
+                                                                              "ver": ref.version.isEmpty ? "1" : ref.version],
+                                                                  contentWorld: .page) as? String) ?? ""
+                guard let d = raw.data(using: .utf8),
+                      let info = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
+                      let uri = info["uri"] as? String, let url = URL(string: uri),
+                      url.scheme?.lowercased() == "https"
+                else {
+                    AppModel.debugLog("portal: Visa-Dokument nicht auflösbar – \(raw.isEmpty ? "keine Antwort" : String(raw.prefix(120)))")
+                    failed += 1
+                    continue
                 }
+                var bytes: Data?
+                var status = 0
+                if let (data, response) = try? await URLSession.shared.data(from: url) {
+                    bytes = data
+                    status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                }
+                if let bytes, bytes.starts(with: Array("%PDF".utf8)) {
+                    out.append(PortalStatement(date: s.date, bytes: bytes))
+                } else {
+                    AppModel.debugLog("portal: Visa-PDF nicht ladbar – signierte URL (status=\(status))")
+                    failed += 1
+                }
+                continue
+            }
+            let b64 = (try? await webView.callAsyncJavaScript(download, arguments: ["path": s.path, "host": keyHost],
+                                                              contentWorld: .page) as? String) ?? ""
+            guard let data = Data(base64Encoded: b64), data.starts(with: Array("%PDF".utf8)) else {
+                AppModel.debugLog("portal: PDF-Link nicht ladbar – keine Antwort")
                 failed += 1
                 continue
             }
